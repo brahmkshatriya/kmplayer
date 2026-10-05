@@ -69,7 +69,7 @@ struct kmplayer_mf_player {
     volatile LONG pending = 0;
     volatile LONG last_error = 0;
     bool mf_started = false;
-    bool co_uninitialize = false;
+    CO_MTA_USAGE_COOKIE mta_cookie = nullptr;
 };
 
 static void km_copy_message(char *destination, size_t size, const char *source) {
@@ -201,11 +201,9 @@ kmplayer_mf_player *kmplayer_mf_player_create(int audio_only, char *error_messag
         return nullptr;
     }
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (SUCCEEDED(hr)) {
-        player->co_uninitialize = true;
-    } else if (hr != RPC_E_CHANGED_MODE) {
-        km_copy_hresult(error_message, error_message_size, "CoInitializeEx failed", hr);
+    HRESULT hr = CoIncrementMTAUsage(&player->mta_cookie);
+    if (FAILED(hr)) {
+        km_copy_hresult(error_message, error_message_size, "CoIncrementMTAUsage failed", hr);
         delete player;
         return nullptr;
     }
@@ -213,7 +211,8 @@ kmplayer_mf_player *kmplayer_mf_player_create(int audio_only, char *error_messag
     hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     if (FAILED(hr)) {
         km_copy_hresult(error_message, error_message_size, "MFStartup failed", hr);
-        if (player->co_uninitialize) CoUninitialize();
+        CoDecrementMTAUsage(player->mta_cookie);
+        player->mta_cookie = nullptr;
         delete player;
         return nullptr;
     }
@@ -329,9 +328,9 @@ void kmplayer_mf_player_destroy(kmplayer_mf_player *player) {
         MFShutdown();
         player->mf_started = false;
     }
-    if (player->co_uninitialize) {
-        CoUninitialize();
-        player->co_uninitialize = false;
+    if (player->mta_cookie) {
+        CoDecrementMTAUsage(player->mta_cookie);
+        player->mta_cookie = nullptr;
     }
     delete player;
 }

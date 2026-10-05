@@ -106,6 +106,10 @@ void kmplayer_gst_player_destroy(kmplayer_gst_player *player) {
 int kmplayer_gst_player_load(kmplayer_gst_player *player, const char *uri, int play_when_ready) {
     if (!player || !uri) return 0;
     gst_element_set_state(player->playbin, GST_STATE_NULL);
+    if (player->last_sample) {
+        gst_sample_unref(player->last_sample);
+        player->last_sample = NULL;
+    }
     g_object_set(G_OBJECT(player->playbin), "uri", uri, NULL);
     player->speed = 1.0;
     GstStateChangeReturn result = gst_element_set_state(
@@ -197,14 +201,19 @@ int kmplayer_gst_player_set_video_enabled(kmplayer_gst_player *player, int enabl
             player->video_sink = GST_APP_SINK(sink);
         }
         flags |= 1u;
+        g_object_set(G_OBJECT(player->playbin), "flags", flags, NULL);
     } else {
         flags &= ~1u;
+        g_object_set(G_OBJECT(player->playbin), "flags", flags, NULL);
         if (player->last_sample) {
             gst_sample_unref(player->last_sample);
             player->last_sample = NULL;
         }
+        if (player->video_sink) {
+            g_object_set(G_OBJECT(player->playbin), "video-sink", NULL, NULL);
+            player->video_sink = NULL;
+        }
     }
-    g_object_set(G_OBJECT(player->playbin), "flags", flags, NULL);
     return 1;
 }
 
