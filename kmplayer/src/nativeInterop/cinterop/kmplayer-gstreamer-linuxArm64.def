@@ -1,0 +1,7 @@
+headers = kmplayer_gst_bridge.h
+headerFilter = kmplayer_gst_bridge.h
+package = dev.brahmkshatriya.kmplayer.gstreamer
+compilerOpts = -Isrc/nativeInterop/cinterop/include
+staticLibraries = libkmplayer_gst_bridge.a
+libraryPaths = build/native/gstreamer/linuxArm64
+linkerOpts = -lgstapp-1.0 -lgstvideo-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lm
