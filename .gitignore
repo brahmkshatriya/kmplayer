@@ -6,3 +6,5 @@ local.properties
 .idea/
 kotlin-js-store/
 node_modules/
+__pycache__/
+*.pyc
