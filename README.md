@@ -1,5 +1,7 @@
 # kmplayer
 
+[![Maven Central](https://img.shields.io/maven-central/v/dev.brahmkshatriya.kmplayer/kmplayer?label=Maven%20Central)](https://central.sonatype.com/artifact/dev.brahmkshatriya.kmplayer/kmplayer)
+
 Kotlin Multiplatform audio and video playback using the platform media stack on Android, Apple platforms, Windows, Linux, JavaScript, and WasmJS.
 
 `kmplayer` provides one Kotlin API for playback and HLS. `kmplayer-compose` adds a Compose Multiplatform video surface.
