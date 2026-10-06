@@ -69,8 +69,9 @@ jobs:
             tasks: ':kmplayer:publishLinuxX64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxX64PublicationToReleaseShardRepository'
           - id: linux-arm64
             name: Linux arm64
-            runner: ubuntu-24.04
+            runner: ubuntu-24.04-arm
             linux: arm64
+            expected_arch: aarch64
             tasks: ':kmplayer:publishLinuxArm64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxArm64PublicationToReleaseShardRepository'
           - id: windows-x64
             name: Windows x64
@@ -122,9 +123,6 @@ jobs:
             pkg-config \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
-          if [[ "${{ matrix.linux }}" == "arm64" ]]; then
-            sudo apt-get install --yes gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          fi
 
       - name: Verify runner architecture
         if: matrix.expected_arch
@@ -154,12 +152,6 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf build/maven-release-shard
-
-          if [[ "$LINUX_ARCH" == "arm64" ]]; then
-            export KMPLAYER_LINUX_ARM64_CC=aarch64-linux-gnu-gcc
-            export KMPLAYER_LINUX_ARM64_AR=aarch64-linux-gnu-ar
-            export KMPLAYER_LINUX_ARM64_CFLAGS="$(pkg-config --cflags gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1.0)"
-          fi
 
           ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS
           test -d build/maven-release-shard/dev/brahmkshatriya/kmplayer
