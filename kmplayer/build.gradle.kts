@@ -235,12 +235,16 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
     }
 
     val configuredCompiler = project.providers.environmentVariable("KMPLAYER_${stem}_CC")
+    val prebuiltArchive = project.providers.environmentVariable("KMPLAYER_${stem}_PREBUILT_ARCHIVE")
+    val usesPrebuiltArchive = prebuiltArchive.isPresent
     val compilerAvailable = configuredCompiler.isPresent || defaultCompiler != null
 
     val compileBridge = project.tasks.register<Exec>("compileKMPlayerGStreamerBridge$suffix") {
         inputs.files(gstBridgeSources)
         outputs.file(objectFile)
-        onlyIf("a compatible GStreamer C compiler is configured for $targetName") { compilerAvailable }
+        onlyIf("a compatible GStreamer C compiler is configured for $targetName") {
+            compilerAvailable && !usesPrebuiltArchive
+        }
         doFirst {
             outputDir.get().asFile.mkdirs()
             val compiler = configuredCompiler.orNull?.commandParts()?.takeIf(List<String>::isNotEmpty)
@@ -282,7 +286,9 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
         dependsOn(compileBridge)
         inputs.file(objectFile)
         outputs.file(archiveFile)
-        onlyIf("a compatible GStreamer C compiler is configured for $targetName") { compilerAvailable }
+        onlyIf("a compatible GStreamer C compiler is configured for $targetName") {
+            compilerAvailable && !usesPrebuiltArchive
+        }
         doFirst {
             val archiver = project.providers.environmentVariable("KMPLAYER_${stem}_AR").orNull
                 ?.commandParts()
@@ -298,6 +304,13 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
         }
     }
 
+    val stagePrebuiltBridge = project.tasks.register<Copy>("stagePrebuiltKMPlayerGStreamerBridge$suffix") {
+        onlyIf("a prebuilt GStreamer bridge is configured for $targetName") { usesPrebuiltArchive }
+        from(prebuiltArchive)
+        into(outputDir)
+        rename { "libkmplayer_gst_bridge.a" }
+    }
+
     compilations.getByName("main") {
         cinterops.create("KMPlayerGStreamer") {
             defFile(project.file("src/nativeInterop/cinterop/kmplayer-gstreamer-$targetName.def"))
@@ -305,9 +318,15 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
     }
 
     project.tasks.matching { it.name == "cinteropKMPlayerGStreamer$suffix" }.configureEach {
-        dependsOn(archiveBridge)
+        if (usesPrebuiltArchive) {
+            dependsOn(stagePrebuiltBridge)
+        } else {
+            dependsOn(archiveBridge)
+        }
         inputs.file(archiveFile)
-        onlyIf("a compatible GStreamer bridge toolchain is configured for $targetName") { compilerAvailable }
+        onlyIf("a compatible GStreamer bridge toolchain is configured for $targetName") {
+            compilerAvailable || usesPrebuiltArchive
+        }
     }
 }
 

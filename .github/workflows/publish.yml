@@ -42,9 +42,50 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  linux-arm64-bridge:
+    name: Build Linux arm64 GStreamer bridge
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install GStreamer development dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            pkg-config \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+      - name: Build arm64 bridge archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/prebuilt-gstreamer-linux-arm64
+          cc \
+            -std=c11 \
+            -O2 \
+            -fPIC \
+            -Ikmplayer/src/nativeInterop/cinterop/include \
+            $(pkg-config --cflags gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1.0) \
+            -c kmplayer/src/nativeInterop/cinterop/kmplayer_gst_bridge.c \
+            -o build/prebuilt-gstreamer-linux-arm64/kmplayer_gst_bridge.o
+          ar rcs \
+            build/prebuilt-gstreamer-linux-arm64/libkmplayer_gst_bridge.a \
+            build/prebuilt-gstreamer-linux-arm64/kmplayer_gst_bridge.o
+          file build/prebuilt-gstreamer-linux-arm64/libkmplayer_gst_bridge.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmplayer-gstreamer-linux-arm64-${{ needs.prepare.outputs.version }}
+          path: build/prebuilt-gstreamer-linux-arm64/libkmplayer_gst_bridge.a
+          if-no-files-found: error
+          retention-days: 5
+
   platform:
     name: Publish ${{ matrix.name }} shard
-    needs: prepare
+    needs: [prepare, linux-arm64-bridge]
     strategy:
       fail-fast: false
       matrix:
@@ -69,9 +110,9 @@ jobs:
             tasks: ':kmplayer:publishLinuxX64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxX64PublicationToReleaseShardRepository'
           - id: linux-arm64
             name: Linux arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-24.04
             linux: arm64
-            expected_arch: aarch64
+            prebuilt_gstreamer_bridge: true
             tasks: ':kmplayer:publishLinuxArm64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxArm64PublicationToReleaseShardRepository'
           - id: windows-x64
             name: Windows x64
@@ -113,7 +154,7 @@ jobs:
           sdkmanager "platforms;android-${sdk_platform}" "build-tools;${build_tools}"
 
       - name: Install Linux native dependencies
-        if: matrix.linux
+        if: matrix.id == 'linux-x64'
         shell: bash
         run: |
           set -euo pipefail
@@ -123,6 +164,12 @@ jobs:
             pkg-config \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev
+
+      - uses: actions/download-artifact@v4
+        if: matrix.prebuilt_gstreamer_bridge == true
+        with:
+          name: kmplayer-gstreamer-linux-arm64-${{ needs.prepare.outputs.version }}
+          path: build/prebuilt-gstreamer-linux-arm64
 
       - name: Verify runner architecture
         if: matrix.expected_arch
@@ -148,10 +195,16 @@ jobs:
         env:
           ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
           TARGET_TASKS: ${{ matrix.tasks }}
+          TARGET_ID: ${{ matrix.id }}
           LINUX_ARCH: ${{ matrix.linux }}
         run: |
           set -euo pipefail
           rm -rf build/maven-release-shard
+
+          if [[ "$TARGET_ID" == "linux-arm64" ]]; then
+            export KMPLAYER_LINUX_ARM64_PREBUILT_ARCHIVE="$GITHUB_WORKSPACE/build/prebuilt-gstreamer-linux-arm64/libkmplayer_gst_bridge.a"
+            test -s "$KMPLAYER_LINUX_ARM64_PREBUILT_ARCHIVE"
+          fi
 
           ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS
           test -d build/maven-release-shard/dev/brahmkshatriya/kmplayer
