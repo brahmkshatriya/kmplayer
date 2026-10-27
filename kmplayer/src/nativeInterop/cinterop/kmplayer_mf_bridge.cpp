@@ -3,6 +3,8 @@
 
 #include <d3d11.h>
 #include <mfapi.h>
+#include <mferror.h>
+#include <mftransform.h>
 #include <objbase.h>
 #include <oleauto.h>
 
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <algorithm>
 
 static const GUID KM_CLSID_MFMediaEngineClassFactory =
     {0xb44392da, 0x499b, 0x446b, {0xa4, 0xcb, 0x00, 0x5f, 0xea, 0xd0, 0xe6, 0xd5}};
@@ -24,6 +27,14 @@ static const GUID KM_MF_MEDIA_ENGINE_CALLBACK =
 static const GUID KM_MF_MEDIA_ENGINE_DXGI_MANAGER =
     {0x065702da, 0x1094, 0x486d, {0x86, 0x17, 0xee, 0x7c, 0xc4, 0xee, 0x46, 0x48}};
 static const DWORD KM_MF_MEDIA_ENGINE_AUDIOONLY = 0x1;
+
+int kmplayer_mf_player_bridge_version(void) { return 1; }
+static const GUID KM_IID_IMFMediaEngineEx =
+    {0x83015ead, 0xb1e6, 0x40d0, {0xa9, 0x8a, 0x37, 0x14, 0x5f, 0xfe, 0x1a, 0xd1}};
+static const GUID KM_IID_IMFTransform =
+    {0xbf94c121, 0x5b05, 0x4e6f, {0x80, 0x00, 0xba, 0x59, 0x89, 0x61, 0x41, 0x4d}};
+
+#include "kmplayer_mf_audio_tap_impl.h"
 
 enum {
     KM_PENDING_READY = 1 << 0,
@@ -48,15 +59,22 @@ public:
     }
     HRESULT STDMETHODCALLTYPE EventNotify(DWORD event, DWORD_PTR param1, DWORD param2) override;
 
-    void detach() { owner_ = nullptr; }
+    void detach() {
+        AcquireSRWLockExclusive(&owner_lock_);
+        owner_ = nullptr;
+        ReleaseSRWLockExclusive(&owner_lock_);
+    }
 
 private:
     volatile LONG ref_count_ = 1;
     kmplayer_mf_player *owner_;
+    SRWLOCK owner_lock_ = SRWLOCK_INIT;
 };
 
 struct kmplayer_mf_player {
     KMIMFMediaEngine *engine = nullptr;
+    KMAudioTap *audio_tap = nullptr;
+    bool audio_tap_installed = false;
     KMMediaEngineNotify *notify = nullptr;
     ID3D11Device *d3d_device = nullptr;
     ID3D11DeviceContext *d3d_context = nullptr;
@@ -162,8 +180,9 @@ HRESULT STDMETHODCALLTYPE KMMediaEngineNotify::QueryInterface(REFIID iid, void *
 }
 
 HRESULT STDMETHODCALLTYPE KMMediaEngineNotify::EventNotify(DWORD event, DWORD_PTR param1, DWORD param2) {
+    AcquireSRWLockShared(&owner_lock_);
     kmplayer_mf_player *player = owner_;
-    if (!player) return S_OK;
+    if (!player) { ReleaseSRWLockShared(&owner_lock_); return S_OK; }
 
     switch (event) {
         case KM_MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
@@ -191,6 +210,7 @@ HRESULT STDMETHODCALLTYPE KMMediaEngineNotify::EventNotify(DWORD event, DWORD_PT
         default:
             break;
     }
+    ReleaseSRWLockShared(&owner_lock_);
     return S_OK;
 }
 
@@ -295,19 +315,44 @@ kmplayer_mf_player *kmplayer_mf_player_create(int audio_only, char *error_messag
         return nullptr;
     }
 
+    // IMFMediaEngineEx::InsertAudioEffect is vtable slot 61 (Windows ABI).
+    // Insert an optional pass-through transform before loading media, so
+    // consumers can enable PCM analysis later without restarting playback.
+    IUnknown *engine_ex = nullptr;
+    if (SUCCEEDED(player->engine->QueryInterface(KM_IID_IMFMediaEngineEx,
+        reinterpret_cast<void **>(&engine_ex))) && engine_ex) {
+        KMAudioTap *tap = new (std::nothrow) KMAudioTap();
+        if (tap) {
+            using InsertAudioEffect = HRESULT (STDMETHODCALLTYPE *)(void *, IUnknown *, BOOL);
+            void **methods = *reinterpret_cast<void ***>(engine_ex);
+            auto insert = reinterpret_cast<InsertAudioEffect>(methods[61]);
+            if (SUCCEEDED(insert(engine_ex, static_cast<IMFTransform *>(tap), TRUE))) {
+                player->audio_tap = tap;
+                player->audio_tap_installed = true;
+            } else {
+                tap->Release();
+            }
+        }
+        engine_ex->Release();
+    }
     return player;
 }
 
 void kmplayer_mf_player_destroy(kmplayer_mf_player *player) {
     if (!player) return;
+    if (player->notify) player->notify->detach();
     if (player->engine) {
         player->engine->Pause();
         player->engine->Shutdown();
         player->engine->Release();
         player->engine = nullptr;
     }
+    if (player->audio_tap) {
+        player->audio_tap->enable(false);
+        player->audio_tap->Release();
+        player->audio_tap = nullptr;
+    }
     if (player->notify) {
-        player->notify->detach();
         player->notify->Release();
         player->notify = nullptr;
     }
@@ -392,6 +437,18 @@ int kmplayer_mf_player_set_speed(kmplayer_mf_player *player, double speed) {
     return SUCCEEDED(player->engine->SetPlaybackRate(speed)) ? 1 : 0;
 }
 
+int kmplayer_mf_player_set_audio_analysis(kmplayer_mf_player *player, int enabled) {
+    if (!player || !player->audio_tap_installed || !player->audio_tap) return 0;
+    player->audio_tap->enable(enabled != 0);
+    return 1;
+}
+
+int kmplayer_mf_player_copy_audio_samples(kmplayer_mf_player *player,
+    float *samples, int capacity, int *sample_rate_hz) {
+    if (!player || !player->audio_tap) return 0;
+    return player->audio_tap->copy(samples, capacity, sample_rate_hz);
+}
+
 int64_t kmplayer_mf_player_position_ms(kmplayer_mf_player *player) {
     if (!player || !player->engine) return -1;
     const double value = player->engine->GetCurrentTime();
@@ -421,6 +478,24 @@ int kmplayer_mf_player_has_hls(kmplayer_mf_player *player) {
         if (SUCCEEDED(hr) && answer != KM_MF_MEDIA_ENGINE_CANPLAY_NOT_SUPPORTED) return 1;
     }
     return 0;
+}
+
+int64_t kmplayer_mf_player_buffered_end_ms(kmplayer_mf_player *player) {
+    if (!player || !player->engine) return -1;
+    KMIMFMediaTimeRange *range = nullptr;
+    if (FAILED(player->engine->GetBuffered(&range)) || !range) return -1;
+    const double position = player->engine->GetCurrentTime();
+    int64_t end_ms = -1;
+    for (DWORD i = 0; i < range->GetLength(); ++i) {
+        double start = 0.0, end = 0.0;
+        if (SUCCEEDED(range->GetStart(i, &start)) && SUCCEEDED(range->GetEnd(i, &end)) &&
+            start <= position + 0.1 && end >= position) {
+            end_ms = (int64_t)(end * 1000.0);
+            break;
+        }
+    }
+    range->Release();
+    return end_ms;
 }
 
 int kmplayer_mf_player_is_seekable(kmplayer_mf_player *player) {
@@ -453,6 +528,14 @@ int kmplayer_mf_player_video_height(kmplayer_mf_player *player) {
 
 uintptr_t kmplayer_mf_player_engine(kmplayer_mf_player *player) {
     return player && player->engine ? reinterpret_cast<uintptr_t>(player->engine) : 0;
+}
+
+int kmplayer_mf_player_copy_video_frame(kmplayer_mf_player *player, void *pixels,
+    int width, int height, int stride) {
+    if (!player || !player->engine) return 0;
+    LONGLONG timestamp = 0;
+    if (player->engine->OnVideoStreamTick(&timestamp) != S_OK) return 0;
+    return kmplayer_mf_player_render_bgra(player, pixels, width, height, stride, 2);
 }
 
 int kmplayer_mf_player_render_bgra(

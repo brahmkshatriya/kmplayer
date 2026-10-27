@@ -4,6 +4,8 @@ package dev.brahmkshatriya.kmplayer.internal
 
 import cnames.structs.kmplayer_mf_player
 import dev.brahmkshatriya.kmplayer.KMBackendKind
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzer
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzerConfig
 import dev.brahmkshatriya.kmplayer.KMMediaSource
 import dev.brahmkshatriya.kmplayer.KMMediaStatus
 import dev.brahmkshatriya.kmplayer.KMPlayerCapabilities
@@ -22,6 +24,7 @@ import dev.brahmkshatriya.kmplayer.mediafoundation.KMPLAYER_MF_EVENT_READY
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_create
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_destroy
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_duration_ms
+import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_buffered_end_ms
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_engine
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_has_hls
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_is_live
@@ -30,6 +33,8 @@ import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_load
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_pause
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_play
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_poll_event
+import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_set_audio_analysis
+import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_copy_audio_samples
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_position_ms
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_render_bgra
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_seek_ms
@@ -41,11 +46,15 @@ import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_video_heig
 import dev.brahmkshatriya.kmplayer.mediafoundation.kmplayer_mf_player_video_width
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.COpaquePointer
+import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.alloc
 import kotlinx.cinterop.cstr
 import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.ptr
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
+import kotlinx.cinterop.value
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,6 +88,21 @@ internal class MediaFoundationKMPlayerBackend(
     private var videoEnabled: Boolean = initialVideoEnabled
     private var pendingSeekMs: Long? = null
     private var resumeAfterReconfigure: Boolean = false
+    private var analyzer: KMPcmSpectrumAnalyzer? = null
+
+    override fun createAudioAnalyzer(config: KMAudioAnalyzerConfig): KMResult<KMAudioAnalyzer> {
+        if (closed) return failure("released", "KMPlayer has been released")
+        if (analyzer != null) return failure("audio-analyzer-active", "Close the existing analyzer first")
+        if (kmplayer_mf_player_set_audio_analysis(handle, 1) == 0) {
+            return failure("audio-analysis-unavailable", "Media Foundation could not install an audio sample tap")
+        }
+        val created = KMPcmSpectrumAnalyzer(config) {
+            if (!closed) kmplayer_mf_player_set_audio_analysis(handle, 0)
+            analyzer = null
+        }
+        analyzer = created
+        return KMResult.Success(created)
+    }
 
     override val state: StateFlow<KMPlayerState> = mutableState.asStateFlow()
     override val events: SharedFlow<KMPlayerEvent> = mutableEvents.asSharedFlow()
@@ -108,15 +132,35 @@ internal class MediaFoundationKMPlayerBackend(
     ) != 0
 
     private val pollingJob: Job = scope.launch {
+        var progressTick = 0
         while (isActive && !closed) {
             pollEvents()
-            refreshProgress()
-            delay(100)
+            captureAudio()
+            // PCM needs frequent draining; metadata only needs the usual
+            // 100ms cadence to avoid excess native calls during FFT capture.
+            if (analyzer == null || progressTick++ % 4 == 0) refreshProgress()
+            delay(if (analyzer != null) 25 else 100)
+        }
+    }
+
+    private fun captureAudio() {
+        val active = analyzer ?: return
+        val samples = FloatArray(8192)
+        val received = memScoped {
+            val rate = alloc<IntVar>()
+            val count = samples.usePinned { pinned ->
+                kmplayer_mf_player_copy_audio_samples(handle, pinned.addressOf(0), samples.size, rate.ptr)
+            }
+            count to rate.value
+        }
+        if (received.first > 0 && received.second > 0) {
+            active.offerOwned(samples.copyOf(received.first), received.second)
         }
     }
 
     override suspend fun load(source: KMMediaSource, playWhenReady: Boolean): KMResult<Unit> = memScoped {
         if (closed) return@memScoped failure("released", "KMPlayer has been released")
+        analyzer?.reset()
         val ok = kmplayer_mf_player_load(handle, source.uri.cstr.ptr, if (playWhenReady) 1 else 0)
         if (ok == 0) return@memScoped failure("media-foundation-load", "Media Foundation rejected the media source")
         mutableState.value = KMPlayerState(
@@ -141,6 +185,7 @@ internal class MediaFoundationKMPlayerBackend(
     }
 
     override fun stop(): KMResult<Unit> = nativeAction("media-foundation-stop") {
+        analyzer?.reset()
         kmplayer_mf_player_stop(handle)
     }.also { result ->
         if (result is KMResult.Success) {
@@ -156,6 +201,7 @@ internal class MediaFoundationKMPlayerBackend(
     }
 
     override fun seekTo(position: Duration): KMResult<Unit> = nativeAction("media-foundation-seek") {
+        analyzer?.reset()
         kmplayer_mf_player_seek_ms(handle, position.inWholeMilliseconds.coerceAtLeast(0L))
     }
 
@@ -196,6 +242,12 @@ internal class MediaFoundationKMPlayerBackend(
         val newHandle = createMediaFoundationHandle(audioOnly = !enabled)
             ?: return failure("media-foundation-video-mode", "Unable to recreate Media Foundation player for video mode change")
 
+        analyzer?.reset()
+        if (analyzer != null && kmplayer_mf_player_set_audio_analysis(newHandle, 1) == 0) {
+            kmplayer_mf_player_destroy(newHandle)
+            return failure("audio-analysis-unavailable", "Unable to restore audio analysis after switching video mode")
+        }
+
         videoEnabled = enabled
         handle = newHandle
         kmplayer_mf_player_set_volume(handle, snapshot.volume / 100.0)
@@ -218,6 +270,7 @@ internal class MediaFoundationKMPlayerBackend(
     override fun close() {
         if (closed) return
         closed = true
+        analyzer?.close()
         runBlocking { pollingJob.cancelAndJoin() }
         scope.cancel()
         kmplayer_mf_player_destroy(handle)
@@ -234,11 +287,13 @@ internal class MediaFoundationKMPlayerBackend(
     private fun refreshProgress() {
         val position = kmplayer_mf_player_position_ms(handle)
         val duration = kmplayer_mf_player_duration_ms(handle)
+        val buffered = kmplayer_mf_player_buffered_end_ms(handle)
         val width = kmplayer_mf_player_video_width(handle)
         val height = kmplayer_mf_player_video_height(handle)
         mutableState.update {
             it.copy(
                 position = position.coerceAtLeast(0L).milliseconds,
+                bufferedPosition = buffered.takeIf { it >= 0L }?.milliseconds,
                 duration = duration.takeIf { value -> value >= 0L }?.milliseconds,
                 seekable = kmplayer_mf_player_is_seekable(handle) != 0,
                 isLive = kmplayer_mf_player_is_live(handle) != 0,

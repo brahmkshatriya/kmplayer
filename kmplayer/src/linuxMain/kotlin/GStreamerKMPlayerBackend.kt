@@ -4,6 +4,8 @@ package dev.brahmkshatriya.kmplayer.internal
 
 import cnames.structs.kmplayer_gst_player
 import dev.brahmkshatriya.kmplayer.KMBackendKind
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzer
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzerConfig
 import dev.brahmkshatriya.kmplayer.KMMediaSource
 import dev.brahmkshatriya.kmplayer.KMMediaStatus
 import dev.brahmkshatriya.kmplayer.KMPlayerCapabilities
@@ -19,11 +21,15 @@ import dev.brahmkshatriya.kmplayer.gstreamer.KMPLAYER_GST_EVENT_ERROR
 import dev.brahmkshatriya.kmplayer.gstreamer.KMPLAYER_GST_EVENT_NONE
 import dev.brahmkshatriya.kmplayer.gstreamer.KMPLAYER_GST_EVENT_READY
 import dev.brahmkshatriya.kmplayer.gstreamer.KMPLAYER_GST_EVENT_TITLE
+import dev.brahmkshatriya.kmplayer.gstreamer.KMPLAYER_GST_EVENT_SPECTRUM
+import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_set_spectrum
+import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_copy_spectrum
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_has_hls
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_init
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_create
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_destroy
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_duration_ms
+import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_buffered_end_ms
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_is_seekable
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_load
 import dev.brahmkshatriya.kmplayer.gstreamer.kmplayer_gst_player_pause
@@ -78,6 +84,22 @@ internal class GStreamerKMPlayerBackend(
     private val mutableEvents = MutableSharedFlow<KMPlayerEvent>(extraBufferCapacity = 16)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var closed = false
+    private var analyzer: KMGstreamerSpectrumAnalyzer? = null
+
+    override fun createAudioAnalyzer(config: KMAudioAnalyzerConfig): KMResult<KMAudioAnalyzer> {
+        if (closed) return failure("released", "KMPlayer has been released")
+        if (analyzer != null) return failure("audio-analyzer-active", "Close the existing analyzer first")
+        if (config.includeWaveform) return failure("audio-analysis-unavailable", "The GStreamer spectrum filter does not expose waveform samples")
+        if (kmplayer_gst_player_set_spectrum(handle, config.fftSize / 2, config.updateRateHz) == 0) {
+            return failure("audio-analysis-unavailable", "GStreamer's spectrum plugin is not installed")
+        }
+        val created = KMGstreamerSpectrumAnalyzer(config) {
+            kmplayer_gst_player_set_spectrum(handle, 0, 0)
+            analyzer = null
+        }
+        analyzer = created
+        return KMResult.Success(created)
+    }
 
     override val state: StateFlow<KMPlayerState> = mutableState.asStateFlow()
     override val events: SharedFlow<KMPlayerEvent> = mutableEvents.asSharedFlow()
@@ -115,6 +137,7 @@ internal class GStreamerKMPlayerBackend(
     }
 
     override suspend fun load(source: KMMediaSource, playWhenReady: Boolean): KMResult<Unit> = memScoped {
+        analyzer?.clear()
         if (closed) return@memScoped failure("released", "KMPlayer has been released")
         val ok = kmplayer_gst_player_load(handle, source.uri.cstr.getPointer(this), if (playWhenReady) 1 else 0)
         if (ok == 0) return@memScoped failure("gstreamer-load", "GStreamer rejected the media source")
@@ -140,6 +163,7 @@ internal class GStreamerKMPlayerBackend(
     }
 
     override fun stop(): KMResult<Unit> = nativeAction("gstreamer-stop") {
+        analyzer?.clear()
         kmplayer_gst_player_stop(handle)
     }.also { result ->
         if (result is KMResult.Success) {
@@ -148,6 +172,7 @@ internal class GStreamerKMPlayerBackend(
     }
 
     override fun seekTo(position: Duration): KMResult<Unit> = nativeAction("gstreamer-seek") {
+        analyzer?.clear()
         kmplayer_gst_player_seek_ms(handle, position.inWholeMilliseconds.coerceAtLeast(0L))
     }
 
@@ -185,6 +210,7 @@ internal class GStreamerKMPlayerBackend(
     override fun close() {
         if (closed) return
         closed = true
+        analyzer?.close()
         runBlocking { pollingJob.cancelAndJoin() }
         scope.cancel()
         kmplayer_gst_player_destroy(handle)
@@ -199,10 +225,12 @@ internal class GStreamerKMPlayerBackend(
     private fun refreshProgress() {
         val position = kmplayer_gst_player_position_ms(handle)
         val duration = kmplayer_gst_player_duration_ms(handle)
+        val buffered = kmplayer_gst_player_buffered_end_ms(handle)
         val seekable = kmplayer_gst_player_is_seekable(handle) != 0
         mutableState.update {
             it.copy(
                 position = position.coerceAtLeast(0L).milliseconds,
+                bufferedPosition = buffered.takeIf { it >= 0L }?.milliseconds,
                 duration = duration.takeIf { value -> value >= 0L }?.milliseconds,
                 seekable = seekable,
                 isLive = duration < 0L && it.mediaStatus == KMMediaStatus.Ready,
@@ -228,6 +256,20 @@ internal class GStreamerKMPlayerBackend(
             if (event.first == KMPLAYER_GST_EVENT_NONE.toInt()) return
 
             when (event.first) {
+                KMPLAYER_GST_EVENT_SPECTRUM.toInt() -> {
+                    val active = analyzer ?: return@repeat
+                    val bins = FloatArray(active.bandCount)
+                    val countAndRate = memScoped {
+                        val sampleRate = alloc<IntVar>()
+                        val count = bins.usePinned { pinned ->
+                            kmplayer_gst_player_copy_spectrum(handle, pinned.addressOf(0), bins.size, sampleRate.ptr)
+                        }
+                        count to sampleRate.value
+                    }
+                    if (countAndRate.first > 0) {
+                        active.publish(countAndRate.second, bins.copyOf(countAndRate.first))
+                    }
+                }
                 KMPLAYER_GST_EVENT_READY.toInt() -> {
                     mutableState.update { it.copy(mediaStatus = KMMediaStatus.Ready, isBuffering = false, error = null) }
                     mutableEvents.tryEmit(KMPlayerEvent.MediaLoaded)

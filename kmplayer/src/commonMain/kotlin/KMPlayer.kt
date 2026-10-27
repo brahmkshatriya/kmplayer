@@ -1,9 +1,20 @@
 package dev.brahmkshatriya.kmplayer
 
 import dev.brahmkshatriya.kmplayer.internal.KMPlayerBackend
+import dev.brahmkshatriya.kmplayer.internal.KMMediaCache
 import dev.brahmkshatriya.kmplayer.internal.createPlatformKMPlayerBackend
+import dev.brahmkshatriya.kmplayer.internal.createPlatformMediaCache
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import kotlin.time.Duration
 
 public enum class KMMediaStatus {
@@ -61,6 +72,8 @@ public data class KMPlayerState(
     val mediaStatus: KMMediaStatus = KMMediaStatus.Idle,
     val playWhenReady: Boolean = false,
     val isBuffering: Boolean = false,
+    /** End of a contiguous buffered interval from the playhead, or null if unknown. */
+    val bufferedPosition: Duration? = null,
     val position: Duration = Duration.ZERO,
     val duration: Duration? = null,
     val volume: Double = 100.0,
@@ -84,6 +97,35 @@ public sealed interface KMPlayerEvent {
     public data class PlaybackError(val error: KMPlayerError) : KMPlayerEvent
 }
 
+/**
+ * Persistent caching for finite HTTP(S) media. HLS/live streams are not downloaded.
+ *
+ * [baseDirectory] is the parent cache directory on native platforms. When null,
+ * the platform's default KMPlayer cache parent is used. [cacheName] is the
+ * cache's subdirectory. On web, the two fields form a Cache Storage namespace;
+ * browsers manage the physical location themselves.
+ */
+public data class KMCacheConfig(
+    val maxSizeBytes: Long = 256L * 1024 * 1024,
+    val maxTrackBytes: Long = 48L * 1024 * 1024,
+    val baseDirectory: String? = null,
+    val cacheName: String = "media",
+) {
+    init {
+        require(maxSizeBytes > 0L && maxTrackBytes in 1..maxSizeBytes) {
+            "Cache limits must be positive and maxTrackBytes must not exceed maxSizeBytes"
+        }
+        require(baseDirectory == null || baseDirectory.isNotBlank()) {
+            "Cache base directory must not be blank; use null for the default"
+        }
+        require(cacheName.isNotBlank() && cacheName != "." && cacheName != ".." &&
+            cacheName == cacheName.trim() && cacheName.none { it in "/\\<>:\"|?*" || it.code < 32 } &&
+            !cacheName.endsWith('.')) {
+            "Cache name must be a valid single directory name"
+        }
+    }
+}
+
 public data class KMPlayerConfig(
     /** Refuse to construct a backend that cannot play HLS. */
     val requireHls: Boolean = true,
@@ -95,6 +137,8 @@ public data class KMPlayerConfig(
      * `true` forces audio-only playback. `false` keeps video enabled even without a surface.
      */
     val audioOnly: Boolean? = null,
+    /** On by default. Set to null to disable persistent HTTP media caching. */
+    val cache: KMCacheConfig? = KMCacheConfig(),
 )
 
 /**
@@ -110,8 +154,20 @@ public data class KMPlayerConfig(
 public class KMPlayer internal constructor(
     internal val platformBackend: KMPlayerBackend,
     public val config: KMPlayerConfig,
+    cacheOverride: KMMediaCache? = null,
 ) : AutoCloseable {
-    public val state: StateFlow<KMPlayerState> get() = platformBackend.state
+    private val cacheScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val cacheDelegate = lazy { cacheOverride ?: config.cache?.let(::createPlatformMediaCache) }
+    private val mediaCache: KMMediaCache? get() = cacheDelegate.value
+    private val localUriMapping = MutableStateFlow<Pair<String, String>?>(null)
+    /** Preserve the requested URL and expose completed cached files as fully buffered. */
+    public val state: StateFlow<KMPlayerState> = combine(platformBackend.state, localUriMapping) { value, mapping ->
+        if (mapping != null && value.uri == mapping.first) value.copy(
+            uri = mapping.second,
+            bufferedPosition = value.bufferedPosition ?: value.duration,
+        )
+        else value
+    }.stateIn(cacheScope, SharingStarted.Eagerly, platformBackend.state.value)
     public val events: SharedFlow<KMPlayerEvent> get() = platformBackend.events
     public val capabilities: KMPlayerCapabilities get() = platformBackend.capabilities
 
@@ -159,8 +215,26 @@ public class KMPlayer internal constructor(
         type: KMMediaSourceType = KMMediaSourceType.Auto,
     ): KMResult<Unit> = load(KMMediaSource(uri, mimeType, type), playWhenReady)
 
-    public suspend fun load(source: KMMediaSource, playWhenReady: Boolean = false): KMResult<Unit> =
-        platformBackend.load(source, playWhenReady)
+    public suspend fun load(source: KMMediaSource, playWhenReady: Boolean = false): KMResult<Unit> {
+        // HLS may consist of playlists and multiple segments: never cache it as a single file.
+        val cache = mediaCache?.takeIf {
+            !source.isHls && (source.uri.startsWith("https://") || source.uri.startsWith("http://"))
+        }
+        val localUri = cache?.cachedUri(source.uri)
+        if (localUri != null) {
+            localUriMapping.value = localUri to source.uri
+            val cachedResult = platformBackend.load(source.copy(uri = localUri), playWhenReady)
+            if (cachedResult is KMResult.Success) return cachedResult
+            // A cached file may be unsupported or damaged; retry the original URL.
+            cache.invalidate(source.uri)
+        }
+        localUriMapping.value = null
+        val result = platformBackend.load(source, playWhenReady)
+        if (result is KMResult.Success && cache != null) {
+            cacheScope.launch { cache.store(source.uri) }
+        }
+        return result
+    }
 
     public fun play(): KMResult<Unit> = platformBackend.play()
     public fun pause(): KMResult<Unit> = platformBackend.pause()
@@ -169,6 +243,16 @@ public class KMPlayer internal constructor(
     public fun setVolume(volume: Double): KMResult<Unit> = platformBackend.setVolume(volume)
     public fun setMuted(muted: Boolean): KMResult<Unit> = platformBackend.setMuted(muted)
     public fun setSpeed(speed: Double): KMResult<Unit> = platformBackend.setSpeed(speed)
+
+    /** Analyze decoded audio from this player without capturing other applications' sound.
+     * Analysis is optional and may disable hardware offload on some platforms.
+     * Backends without a compatible audio tap report audio-analysis-unavailable. */
+    public fun createAudioAnalyzer(config: KMAudioAnalyzerConfig = KMAudioAnalyzerConfig()): KMResult<KMAudioAnalyzer> {
+        if (!config.isValid()) return KMResult.Failure(KMPlayerError(
+            "invalid-audio-analyzer-config", "fftSize must be a power of two from 256 to 8192, updateRateHz 1..60, and smoothing in [0, 1).",
+        ))
+        return platformBackend.createAudioAnalyzer(config)
+    }
 
     /**
      * Registers a video surface with this player.
@@ -204,6 +288,8 @@ public class KMPlayer internal constructor(
     }
 
     override fun close() {
+        cacheScope.cancel()
+        if (cacheDelegate.isInitialized()) mediaCache?.close()
         platformBackend.close()
     }
 

@@ -16,7 +16,8 @@ enum kmplayer_gst_event {
     KMPLAYER_GST_EVENT_ENDED = 2,
     KMPLAYER_GST_EVENT_ERROR = 3,
     KMPLAYER_GST_EVENT_BUFFERING = 4,
-    KMPLAYER_GST_EVENT_TITLE = 5
+    KMPLAYER_GST_EVENT_TITLE = 5,
+    KMPLAYER_GST_EVENT_SPECTRUM = 6
 };
 
 int kmplayer_gst_init(char *error_message, size_t error_message_size);
@@ -34,9 +35,12 @@ int kmplayer_gst_player_set_volume(kmplayer_gst_player *player, double volume_0_
 int kmplayer_gst_player_set_muted(kmplayer_gst_player *player, int muted);
 int kmplayer_gst_player_set_speed(kmplayer_gst_player *player, double speed);
 int kmplayer_gst_player_set_video_enabled(kmplayer_gst_player *player, int enabled);
+int kmplayer_gst_player_set_spectrum(kmplayer_gst_player *player, int bands, int update_rate_hz);
+int kmplayer_gst_player_copy_spectrum(kmplayer_gst_player *player, float *bands, int capacity, int *sample_rate_hz);
 
 int64_t kmplayer_gst_player_position_ms(kmplayer_gst_player *player);
 int64_t kmplayer_gst_player_duration_ms(kmplayer_gst_player *player);
+int64_t kmplayer_gst_player_buffered_end_ms(kmplayer_gst_player *player);
 int kmplayer_gst_player_is_seekable(kmplayer_gst_player *player);
 uintptr_t kmplayer_gst_player_pipeline(kmplayer_gst_player *player);
 int kmplayer_gst_player_render_bgra(

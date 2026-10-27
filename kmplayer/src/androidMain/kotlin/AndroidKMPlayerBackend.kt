@@ -1,5 +1,6 @@
 package dev.brahmkshatriya.kmplayer.internal
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.C
@@ -11,6 +12,15 @@ import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.TeeAudioProcessor
+import androidx.media3.common.audio.AudioProcessor
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzer
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzerConfig
 import dev.brahmkshatriya.kmplayer.KMBackendKind
 import dev.brahmkshatriya.kmplayer.KMMediaSource
 import dev.brahmkshatriya.kmplayer.KMMediaStatus
@@ -36,6 +46,7 @@ internal class AndroidKMPlayerBackend internal constructor(
     internal val player: ExoPlayer,
     private val videoAllowed: Boolean,
     initialVideoEnabled: Boolean,
+    private val audioTap: KMAndroidAudioTap,
 ) : KMPlayerBackend {
     private val handler = Handler(Looper.getMainLooper())
     private val mutableState = MutableStateFlow(KMPlayerState())
@@ -53,6 +64,21 @@ internal class AndroidKMPlayerBackend internal constructor(
         nativeVideoSurface = videoAllowed,
     )
     private var videoEnabled: Boolean = initialVideoEnabled
+    private var analyzer: KMPcmSpectrumAnalyzer? = null
+
+    override fun createAudioAnalyzer(config: KMAudioAnalyzerConfig): KMResult<KMAudioAnalyzer> {
+        if (closed) return KMResult.Failure(KMPlayerError("released", "KMPlayer has been released"))
+        if (analyzer != null) return KMResult.Failure(KMPlayerError("audio-analyzer-active", "Close the existing analyzer before creating another."))
+        val created = KMPcmSpectrumAnalyzer(config) {
+            audioTap.analyzer = null
+            analyzer = null
+            if (!closed) action { applyVideoMode(videoEnabled) }
+        }
+        analyzer = created
+        audioTap.analyzer = created
+        action { applyVideoMode(videoEnabled) }
+        return KMResult.Success(created)
+    }
 
     private val listener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -123,6 +149,7 @@ internal class AndroidKMPlayerBackend internal constructor(
             mutableState.update {
                 it.copy(
                     position = player.currentPosition.coerceAtLeast(0L).milliseconds,
+                    bufferedPosition = player.bufferedPosition.coerceAtLeast(0L).milliseconds,
                     duration = durationMs?.milliseconds,
                     seekable = player.isCurrentMediaItemSeekable,
                     isLive = player.isCurrentMediaItemLive,
@@ -139,6 +166,7 @@ internal class AndroidKMPlayerBackend internal constructor(
     }
 
     override suspend fun load(source: KMMediaSource, playWhenReady: Boolean): KMResult<Unit> = action {
+        analyzer?.reset()
         val itemBuilder = MediaItem.Builder().setUri(source.uri)
         val mime = source.mimeType ?: if (source.isHls) MimeTypes.APPLICATION_M3U8 else null
         mime?.let(itemBuilder::setMimeType)
@@ -148,6 +176,10 @@ internal class AndroidKMPlayerBackend internal constructor(
             it.copy(
                 mediaStatus = KMMediaStatus.Opening,
                 playWhenReady = playWhenReady,
+                position = Duration.ZERO,
+                duration = null,
+                seekable = false,
+                bufferedPosition = null,
                 uri = source.uri,
                 error = null,
             )
@@ -166,11 +198,13 @@ internal class AndroidKMPlayerBackend internal constructor(
     }
 
     override fun stop(): KMResult<Unit> = action {
+        analyzer?.reset()
         player.stop()
         mutableState.update { it.copy(mediaStatus = KMMediaStatus.Idle, playWhenReady = false) }
     }
 
     override fun seekTo(position: Duration): KMResult<Unit> = action {
+        analyzer?.reset()
         player.seekTo(position.inWholeMilliseconds.coerceAtLeast(0L))
     }
 
@@ -214,7 +248,7 @@ internal class AndroidKMPlayerBackend internal constructor(
     private fun applyVideoMode(enabled: Boolean) {
         val offloadPreferences = TrackSelectionParameters.AudioOffloadPreferences.Builder()
             .setAudioOffloadMode(
-                if (enabled) {
+                if (enabled || analyzer != null) {
                     TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED
                 } else {
                     TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
@@ -232,6 +266,7 @@ internal class AndroidKMPlayerBackend internal constructor(
     override fun close() {
         if (closed) return
         closed = true
+        analyzer?.close()
         handler.removeCallbacks(progressTicker)
         if (Looper.myLooper() == Looper.getMainLooper()) {
             player.removeListener(listener)
@@ -256,6 +291,59 @@ internal class AndroidKMPlayerBackend internal constructor(
     }
 }
 
+/** A PCM tee only copies samples while analysis is requested. */
+internal class KMAndroidAudioTap : TeeAudioProcessor.AudioBufferSink {
+    @Volatile var analyzer: KMPcmSpectrumAnalyzer? = null
+    private var rate = 0
+    private var channels = 0
+    private var encoding = 0
+
+    override fun flush(sampleRateHz: Int, channelCount: Int, encoding: Int) {
+        rate = sampleRateHz
+        channels = channelCount
+        this.encoding = encoding
+        analyzer?.reset()
+    }
+
+    override fun handleBuffer(buffer: ByteBuffer) {
+        val active = analyzer ?: return
+        val channelCount = channels
+        val bytesPerSample = when (encoding) {
+            C.ENCODING_PCM_16BIT -> 2
+            C.ENCODING_PCM_FLOAT -> 4
+            else -> return
+        }
+        if (rate <= 0 || channelCount <= 0) return
+        val source = buffer.duplicate().order(ByteOrder.nativeOrder())
+        val frames = source.remaining() / (channelCount * bytesPerSample)
+        if (frames == 0) return
+        val samples = FloatArray(frames)
+        for (i in 0 until frames) {
+            var mono = 0f
+            repeat(channelCount) {
+                mono += if (bytesPerSample == 2) source.short / 32768f else source.float
+            }
+            samples[i] = mono / channelCount
+        }
+        active.offerOwned(samples, rate)
+    }
+}
+
+internal class KMAnalysisRenderersFactory(
+    context: Context,
+    private val tap: KMAndroidAudioTap,
+) : DefaultRenderersFactory(context) {
+    override fun buildAudioSink(
+        context: Context,
+        enableFloatOutput: Boolean,
+        enableAudioTrackPlaybackParams: Boolean,
+    ): AudioSink = DefaultAudioSink.Builder(context)
+        .setEnableFloatOutput(enableFloatOutput)
+        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+        .setAudioProcessors(arrayOf<AudioProcessor>(TeeAudioProcessor(tap)))
+        .build()
+}
+
 internal actual fun createPlatformKMPlayerBackend(config: KMPlayerConfig): KMResult<KMPlayerBackend> {
     val context = KMPlayerAndroid.applicationContext
         ?: return KMResult.Failure(
@@ -266,15 +354,17 @@ internal actual fun createPlatformKMPlayerBackend(config: KMPlayerConfig): KMRes
         )
 
     return try {
+        val audioTap = KMAndroidAudioTap()
+        val renderersFactory = KMAnalysisRenderersFactory(context, audioTap)
         val player = if (Looper.myLooper() == Looper.getMainLooper()) {
-            ExoPlayer.Builder(context).setLooper(Looper.getMainLooper()).build()
+            ExoPlayer.Builder(context, renderersFactory).setLooper(Looper.getMainLooper()).build()
         } else {
             var created: ExoPlayer? = null
             var failure: Throwable? = null
             val latch = java.util.concurrent.CountDownLatch(1)
             Handler(Looper.getMainLooper()).post {
                 try {
-                    created = ExoPlayer.Builder(context).setLooper(Looper.getMainLooper()).build()
+                    created = ExoPlayer.Builder(context, renderersFactory).setLooper(Looper.getMainLooper()).build()
                 } catch (error: Throwable) {
                     failure = error
                 } finally {
@@ -290,6 +380,7 @@ internal actual fun createPlatformKMPlayerBackend(config: KMPlayerConfig): KMRes
                 player = player,
                 videoAllowed = config.audioOnly != true,
                 initialVideoEnabled = config.audioOnly == false,
+                audioTap = audioTap,
             ),
         )
     } catch (error: Throwable) {

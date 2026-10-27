@@ -49,6 +49,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Verify runner architecture
+        shell: bash
+        run: test "$(uname -m)" = aarch64
       - name: Install GStreamer development dependencies
         shell: bash
         run: |
@@ -64,12 +67,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/prebuilt-gstreamer-linux-arm64
+          read -r -a gst_cflags <<< "$(pkg-config --cflags gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1.0)"
           cc \
             -std=c11 \
             -O2 \
             -fPIC \
             -Ikmplayer/src/nativeInterop/cinterop/include \
-            $(pkg-config --cflags gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1.0) \
+            "${gst_cflags[@]}" \
             -c kmplayer/src/nativeInterop/cinterop/kmplayer_gst_bridge.c \
             -o build/prebuilt-gstreamer-linux-arm64/kmplayer_gst_bridge.o
           ar rcs \
@@ -83,13 +87,74 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
-  platform:
-    name: Publish ${{ matrix.name }} shard
-    needs: [prepare, linux-arm64-bridge]
+  jvm-native-bridges:
+    name: Build JVM bridge (${{ matrix.id }})
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         include:
+          - id: windows-x86_64
+            runner: windows-2025
+            task: buildJvmNativeBridgeWindowsX64
+          - id: macos-x86_64
+            runner: macos-15-intel
+            expected_arch: x86_64
+            task: buildJvmNativeBridgeMacosX64
+          - id: macos-aarch64
+            runner: macos-15
+            expected_arch: arm64
+            task: buildJvmNativeBridgeMacosArm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: corretto
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Verify runner architecture
+        if: matrix.expected_arch
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Verify Xcode
+        if: startsWith(matrix.id, 'macos-')
+        shell: bash
+        run: xcodebuild -version
+      - name: Enable MinGW compiler
+        if: startsWith(matrix.id, 'windows-')
+        shell: pwsh
+        run: |
+          $candidates = @('C:\mingw64\bin', 'C:\msys64\mingw64\bin')
+          $compiler = $candidates | Where-Object { Test-Path "$_\g++.exe" } | Select-Object -First 1
+          if (-not $compiler) { throw 'MinGW g++ is required to build the JVM bridge' }
+          Add-Content $env:GITHUB_PATH $compiler
+      - name: Compile native media bridge
+        shell: bash
+        env:
+          BRIDGE_TASK: ${{ matrix.task }}
+        run: ./gradlew --no-daemon --stacktrace --no-configuration-cache ":kmplayer:$BRIDGE_TASK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmplayer-jvm-native-${{ matrix.id }}-${{ needs.prepare.outputs.version }}
+          path: kmplayer/build/generated/jvmNative/native/${{ matrix.id }}
+          if-no-files-found: error
+          retention-days: 5
+
+  platform:
+    name: Publish ${{ matrix.name }} shard
+    needs: [prepare, linux-arm64-bridge, jvm-native-bridges]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: jvm
+            name: JVM
+            runner: ubuntu-24.04
+            tasks: ':kmplayer:publishJvmPublicationToReleaseShardRepository :kmplayer-compose:publishJvmPublicationToReleaseShardRepository'
           - id: android
             name: Android
             runner: ubuntu-24.04
@@ -106,12 +171,14 @@ jobs:
           - id: linux-x64
             name: Linux x64
             runner: ubuntu-24.04
-            linux: x64
+            linux: true
+            expected_arch: x86_64
             tasks: ':kmplayer:publishLinuxX64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxX64PublicationToReleaseShardRepository'
           - id: linux-arm64
             name: Linux arm64
             runner: ubuntu-24.04
-            linux: arm64
+            linux: true
+            expected_arch: x86_64
             prebuilt_gstreamer_bridge: true
             tasks: ':kmplayer:publishLinuxArm64PublicationToReleaseShardRepository :kmplayer-compose:publishLinuxArm64PublicationToReleaseShardRepository'
           - id: windows-x64
@@ -133,6 +200,16 @@ jobs:
             runner: macos-15
             expected_arch: arm64
             tasks: ':kmplayer:publishIosArm64PublicationToReleaseShardRepository :kmplayer-compose:publishIosArm64PublicationToReleaseShardRepository'
+          - id: ios-simulator-arm64
+            name: iOS simulator arm64
+            runner: macos-15
+            expected_arch: arm64
+            tasks: ':kmplayer:publishIosSimulatorArm64PublicationToReleaseShardRepository :kmplayer-compose:publishIosSimulatorArm64PublicationToReleaseShardRepository'
+          - id: ios-x64
+            name: iOS simulator x64
+            runner: macos-15-intel
+            expected_arch: x86_64
+            tasks: ':kmplayer:publishIosX64PublicationToReleaseShardRepository :kmplayer-compose:publishIosX64PublicationToReleaseShardRepository'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -154,7 +231,7 @@ jobs:
           sdkmanager "platforms;android-${sdk_platform}" "build-tools;${build_tools}"
 
       - name: Install Linux native dependencies
-        if: matrix.id == 'linux-x64'
+        if: matrix.linux == true
         shell: bash
         run: |
           set -euo pipefail
@@ -190,13 +267,28 @@ jobs:
           clang++ --version
           llvm-ar --version
 
+      - uses: actions/download-artifact@v4
+        if: matrix.id == 'jvm'
+        with:
+          name: kmplayer-jvm-native-windows-x86_64-${{ needs.prepare.outputs.version }}
+          path: build/jvm-native/windows-x86_64
+      - uses: actions/download-artifact@v4
+        if: matrix.id == 'jvm'
+        with:
+          name: kmplayer-jvm-native-macos-x86_64-${{ needs.prepare.outputs.version }}
+          path: build/jvm-native/macos-x86_64
+      - uses: actions/download-artifact@v4
+        if: matrix.id == 'jvm'
+        with:
+          name: kmplayer-jvm-native-macos-aarch64-${{ needs.prepare.outputs.version }}
+          path: build/jvm-native/macos-aarch64
+
       - name: Build Maven publication shard
         shell: bash
         env:
           ORG_GRADLE_PROJECT_VERSION_NAME: ${{ needs.prepare.outputs.version }}
           TARGET_TASKS: ${{ matrix.tasks }}
           TARGET_ID: ${{ matrix.id }}
-          LINUX_ARCH: ${{ matrix.linux }}
         run: |
           set -euo pipefail
           rm -rf build/maven-release-shard
@@ -206,7 +298,15 @@ jobs:
             test -s "$KMPLAYER_LINUX_ARM64_PREBUILT_ARCHIVE"
           fi
 
-          ./gradlew --no-daemon --stacktrace --no-configuration-cache $TARGET_TASKS
+          if [[ "$TARGET_ID" == "jvm" ]]; then
+            export KMPLAYER_JVM_NATIVE_DIR="$GITHUB_WORKSPACE/build/jvm-native"
+            set -- -Pkmplayer.requireAllJvmNatives=true
+          else
+            set --
+          fi
+
+          read -r -a tasks <<< "$TARGET_TASKS"
+          ./gradlew --no-daemon --stacktrace --no-configuration-cache "$@" "${tasks[@]}"
           test -d build/maven-release-shard/dev/brahmkshatriya/kmplayer
 
       - uses: actions/upload-artifact@v4
@@ -285,14 +385,28 @@ jobs:
           root="release/merged/dev/brahmkshatriya/kmplayer"
           modules=(
             kmplayer kmplayer-compose
-            kmplayer-android kmplayer-js kmplayer-wasm-js kmplayer-linuxx64 kmplayer-linuxarm64 kmplayer-mingwx64 kmplayer-macosx64 kmplayer-macosarm64 kmplayer-iosarm64
-            kmplayer-compose-android kmplayer-compose-js kmplayer-compose-wasm-js kmplayer-compose-linuxx64 kmplayer-compose-linuxarm64 kmplayer-compose-mingwx64 kmplayer-compose-macosx64 kmplayer-compose-macosarm64 kmplayer-compose-iosarm64
+            kmplayer-android kmplayer-js kmplayer-wasm-js kmplayer-linuxx64 kmplayer-linuxarm64 kmplayer-mingwx64 kmplayer-macosx64 kmplayer-macosarm64 kmplayer-iosarm64 kmplayer-jvm kmplayer-iossimulatorarm64 kmplayer-iosx64
+            kmplayer-compose-android kmplayer-compose-js kmplayer-compose-wasm-js kmplayer-compose-linuxx64 kmplayer-compose-linuxarm64 kmplayer-compose-mingwx64 kmplayer-compose-macosx64 kmplayer-compose-macosarm64 kmplayer-compose-iosarm64 kmplayer-compose-jvm kmplayer-compose-iossimulatorarm64 kmplayer-compose-iosx64
           )
           for module in "${modules[@]}"; do
             directory="$root/$module/$RELEASE_VERSION"
             test -d "$directory" || { echo "Missing publication: $module" >&2; exit 1; }
             test -n "$(find "$directory" -maxdepth 1 -name '*.pom' -print -quit)" || { echo "Missing POM: $module" >&2; exit 1; }
           done
+          jvm_jar="$root/kmplayer-jvm/$RELEASE_VERSION/kmplayer-jvm-$RELEASE_VERSION.jar"
+          python3 - "$jvm_jar" <<'PY'
+          import sys
+          from zipfile import ZipFile
+
+          with ZipFile(sys.argv[1]) as jar:
+              for entry in (
+                  "native/windows-x86_64/kmplayer_mf.dll",
+                  "native/macos-x86_64/libkmplayer_av.dylib",
+                  "native/macos-aarch64/libkmplayer_av.dylib",
+              ):
+                  if jar.getinfo(entry).file_size == 0:
+                      raise SystemExit(f"Empty JVM native bridge: {entry}")
+          PY
           if find "$root" -type f \( -name '*.pom' -o -name '*.module' \) -exec grep -Il 'SNAPSHOT' {} + | grep -q .; then
             echo 'SNAPSHOT metadata leaked into release repository' >&2
             exit 1
@@ -331,6 +445,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
+          chmod +x scripts/publish-maven-central-bundle.sh
           scripts/publish-maven-central-bundle.sh \
             "$GITHUB_WORKSPACE/release/merged" \
             "$RELEASE_VERSION" \

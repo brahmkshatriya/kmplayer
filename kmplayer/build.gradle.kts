@@ -135,6 +135,7 @@ private fun KotlinNativeTarget.configureMediaFoundationInterop() {
         "src/nativeInterop/cinterop/kmplayer_mf_bridge.cpp",
         "src/nativeInterop/cinterop/include/kmplayer_mf_bridge.h",
         "src/nativeInterop/cinterop/include/kmplayer_mfmediaengine_abi.h",
+        "src/nativeInterop/cinterop/include/kmplayer_mf_audio_tap_impl.h",
     )
 
     val compileBridge = project.tasks.register<Exec>("compileKMPlayerMediaFoundationBridge$suffix") {
@@ -231,20 +232,24 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
     val defaultCompiler = when {
         targetName == "linuxX64" && hostOs.contains("linux") && !hostIsArm64 -> listOf("cc")
         targetName == "linuxArm64" && hostOs.contains("linux") && hostIsArm64 -> listOf("cc")
+        targetName == "linuxArm64" && hostOs.contains("linux") -> {
+            val toolchain = konanDependency("aarch64-unknown-linux-gnu-gcc-8.3.0-glibc-2.25-kernel-4.9-2")
+            val compiler = toolchain?.resolve("bin/aarch64-unknown-linux-gnu-gcc")
+            compiler?.takeIf(File::isFile)?.let { listOf(it.absolutePath) }
+        }
         else -> null
     }
 
     val configuredCompiler = project.providers.environmentVariable("KMPLAYER_${stem}_CC")
     val prebuiltArchive = project.providers.environmentVariable("KMPLAYER_${stem}_PREBUILT_ARCHIVE")
     val usesPrebuiltArchive = prebuiltArchive.isPresent
-    val compilerAvailable = configuredCompiler.isPresent || defaultCompiler != null
 
     val compileBridge = project.tasks.register<Exec>("compileKMPlayerGStreamerBridge$suffix") {
         inputs.files(gstBridgeSources)
+        inputs.property("compiler", configuredCompiler.orElse(defaultCompiler?.joinToString(" ") ?: "unavailable"))
+        inputs.property("cflags", project.providers.environmentVariable("KMPLAYER_${stem}_CFLAGS").orElse(""))
         outputs.file(objectFile)
-        onlyIf("a compatible GStreamer C compiler is configured for $targetName") {
-            compilerAvailable && !usesPrebuiltArchive
-        }
+        onlyIf("no prebuilt GStreamer archive is configured for $targetName") { !usesPrebuiltArchive }
         doFirst {
             outputDir.get().asFile.mkdirs()
             val compiler = configuredCompiler.orNull?.commandParts()?.takeIf(List<String>::isNotEmpty)
@@ -286,9 +291,7 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
         dependsOn(compileBridge)
         inputs.file(objectFile)
         outputs.file(archiveFile)
-        onlyIf("a compatible GStreamer C compiler is configured for $targetName") {
-            compilerAvailable && !usesPrebuiltArchive
-        }
+        onlyIf("no prebuilt GStreamer archive is configured for $targetName") { !usesPrebuiltArchive }
         doFirst {
             val archiver = project.providers.environmentVariable("KMPLAYER_${stem}_AR").orNull
                 ?.commandParts()
@@ -324,9 +327,6 @@ private fun KotlinNativeTarget.configureGStreamerInterop() {
             dependsOn(archiveBridge)
         }
         inputs.file(archiveFile)
-        onlyIf("a compatible GStreamer bridge toolchain is configured for $targetName") {
-            compilerAvailable || usesPrebuiltArchive
-        }
     }
 }
 
@@ -341,9 +341,12 @@ kotlin {
         configureGStreamerInterop()
         configureNativeLibraryDirs()
     }
+    jvm { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
     macosX64()
     macosArm64()
     iosArm64()
+    iosSimulatorArm64()
+    iosX64()
     mingwX64 { configureMediaFoundationInterop() }
 
     js {
@@ -363,6 +366,8 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
+            implementation("com.squareup.okio:okio:3.18.2")
+            implementation("io.ktor:ktor-client-core:3.6.0")
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
@@ -379,6 +384,7 @@ kotlin {
         androidMain.dependencies {
             api("androidx.media3:media3-exoplayer:$media3Version")
             api("androidx.media3:media3-exoplayer-hls:$media3Version")
+            implementation("io.ktor:ktor-client-okhttp:3.6.0")
         }
 
         jsMain {
@@ -394,10 +400,25 @@ kotlin {
             }
         }
 
-        linuxX64Main { kotlin.srcDir("src/linuxMain/kotlin") }
-        linuxArm64Main { kotlin.srcDir("src/linuxMain/kotlin") }
-        macosX64Main { kotlin.srcDir("src/macosMain/kotlin") }
-        macosArm64Main { kotlin.srcDir("src/macosMain/kotlin") }
+        linuxX64Main { kotlin.srcDir("src/linuxMain/kotlin"); dependencies { implementation("io.ktor:ktor-client-curl:3.6.0") } }
+        linuxArm64Main { kotlin.srcDir("src/linuxMain/kotlin"); dependencies { implementation("io.ktor:ktor-client-curl:3.6.0") } }
+        macosX64Main { kotlin.srcDir("src/macosMain/kotlin"); dependencies { implementation("io.ktor:ktor-client-darwin:3.6.0") } }
+        macosArm64Main { kotlin.srcDir("src/macosMain/kotlin"); dependencies { implementation("io.ktor:ktor-client-darwin:3.6.0") } }
+        val iosMain by creating {
+            dependsOn(commonMain.get())
+            dependencies { implementation("io.ktor:ktor-client-darwin:3.6.0") }
+        }
+        iosArm64Main { dependsOn(iosMain) }
+        iosSimulatorArm64Main { dependsOn(iosMain) }
+        iosX64Main { dependsOn(iosMain) }
+        jvmMain.dependencies {
+            api("org.freedesktop.gstreamer:gst1-java-core:1.4.0")
+            implementation("net.java.dev.jna:jna:5.19.1")
+            implementation("io.ktor:ktor-client-java:3.6.0")
+        }
+        mingwX64Main.dependencies { implementation("io.ktor:ktor-client-winhttp:3.6.0") }
 
     }
 }
+
+apply(from = "gradle/jvm-native.gradle.kts")

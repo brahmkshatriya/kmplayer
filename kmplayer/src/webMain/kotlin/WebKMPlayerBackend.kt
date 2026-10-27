@@ -3,6 +3,8 @@
 package dev.brahmkshatriya.kmplayer.internal
 
 import dev.brahmkshatriya.kmplayer.KMBackendKind
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzer
+import dev.brahmkshatriya.kmplayer.KMAudioAnalyzerConfig
 import dev.brahmkshatriya.kmplayer.KMMediaSource
 import dev.brahmkshatriya.kmplayer.KMMediaStatus
 import dev.brahmkshatriya.kmplayer.KMPlayerCapabilities
@@ -41,6 +43,23 @@ internal class WebKMPlayerBackend internal constructor(
     private var videoEnabled: Boolean = initialVideoEnabled
     private var pendingSeekSeconds: Double? = null
     private var closed = false
+    private var analyzer: WebAudioAnalyzer? = null
+
+    override fun createAudioAnalyzer(config: KMAudioAnalyzerConfig): KMResult<KMAudioAnalyzer> {
+        if (closed) return fail("released", "KMPlayer has been released")
+        if (analyzer != null) return fail("audio-analyzer-active", "Close the existing analyzer first")
+        // Web Audio cannot inspect cross-origin media fetched without CORS.
+        // Opt in only when a consumer requests analysis, before its next load.
+        if (!media.hasAttribute("crossorigin")) media.setAttribute("crossorigin", "anonymous")
+        return when (val source = openWebSpectrumReader(media, config)) {
+            is KMResult.Success -> {
+                val created = WebAudioAnalyzer(config, { analyzer = null }, source.value)
+                analyzer = created
+                KMResult.Success(created)
+            }
+            is KMResult.Failure -> source
+        }
+    }
 
     override val state: StateFlow<KMPlayerState> = mutableState.asStateFlow()
     override val events: SharedFlow<KMPlayerEvent> = mutableEvents.asSharedFlow()
@@ -61,6 +80,7 @@ internal class WebKMPlayerBackend internal constructor(
     }
 
     override fun play(): KMResult<Unit> = action {
+        resumeWebAudioMedia(media)
         media.play()
         mutableState.update { it.copy(playWhenReady = true) }
     }
@@ -123,6 +143,8 @@ internal class WebKMPlayerBackend internal constructor(
 
         videoEnabled = enabled
         media = createMediaElement(enabled) ?: return@actionResult fail("html-media", "Unable to create HTMLMediaElement")
+        analyzer?.reattach(media)
+        releaseWebAudioMedia(old)
         media.volume = volume
         media.muted = muted
         media.playbackRate = speed
@@ -134,6 +156,8 @@ internal class WebKMPlayerBackend internal constructor(
     override fun close() {
         if (closed) return
         closed = true
+        analyzer?.close()
+        releaseWebAudioMedia(media)
         removeListeners(media)
         hls?.destroy()
         hls = null
@@ -188,6 +212,7 @@ internal class WebKMPlayerBackend internal constructor(
             it.copy(
                 mediaStatus = KMMediaStatus.Opening,
                 playWhenReady = playWhenReady,
+                bufferedPosition = null,
                 isBuffering = true,
                 uri = source.uri,
                 error = null,
@@ -203,7 +228,10 @@ internal class WebKMPlayerBackend internal constructor(
             media.src = source.uri
             media.load()
         }
-        if (playWhenReady) media.play()
+        if (playWhenReady) {
+            resumeWebAudioMedia(media)
+            media.play()
+        }
         return KMResult.Success(Unit)
     }
 
@@ -215,9 +243,24 @@ internal class WebKMPlayerBackend internal constructor(
         if (closed) return
         val duration = media.duration.takeIf { it.isFinite() && it >= 0.0 }
         val video = media as? HTMLVideoElement
+        val currentSeconds = media.currentTime.coerceAtLeast(0.0)
+        // The end must belong to a range containing the playhead: a range at
+        // another seek position is not buffered playback from here.
+        var bufferedEnd: Double? = null
+        for (index in 0 until media.buffered.length) {
+            val start = media.buffered.start(index)
+            val end = media.buffered.end(index)
+            if (start <= currentSeconds + 0.1 && end >= currentSeconds) {
+                bufferedEnd = end
+                break
+            }
+        }
         mutableState.update {
             it.copy(
                 position = (media.currentTime.coerceAtLeast(0.0) * 1000.0).roundToLong().milliseconds,
+                bufferedPosition = bufferedEnd?.let { seconds ->
+                    (seconds * 1000.0).roundToLong().milliseconds
+                },
                 duration = duration?.let { seconds -> (seconds * 1000.0).roundToLong().milliseconds },
                 volume = media.volume * 100.0,
                 muted = media.muted,

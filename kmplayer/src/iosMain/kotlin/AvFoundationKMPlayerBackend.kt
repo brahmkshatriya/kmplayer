@@ -22,9 +22,12 @@ import kotlinx.coroutines.flow.update
 import platform.AVFoundation.*
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
+import platform.CoreMedia.CMTimeRangeContainsTime
+import platform.CoreMedia.CMTimeRangeGetEnd
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
+import platform.Foundation.NSValue
 import platform.Foundation.removeObserver
 import kotlin.math.roundToLong
 import kotlin.time.Duration
@@ -226,6 +229,11 @@ internal class AvFoundationKMPlayerBackend internal constructor(
         val durationSeconds = CMTimeGetSeconds(item.duration)
         val position = positionSeconds.takeIf { it.isFinite() && it >= 0.0 }
         val duration = durationSeconds.takeIf { it.isFinite() && it > 0.0 }
+        val bufferedEnd = item.loadedTimeRanges.firstNotNullOfOrNull { range ->
+            val timeRange = (range as? NSValue)?.CMTimeRangeValue ?: return@firstNotNullOfOrNull null
+            if (!CMTimeRangeContainsTime(timeRange, item.currentTime())) null
+            else CMTimeGetSeconds(CMTimeRangeGetEnd(timeRange)).takeIf(Double::isFinite)
+        }
         var width: Int? = null
         var height: Int? = null
         if (videoEnabled) {
@@ -237,6 +245,7 @@ internal class AvFoundationKMPlayerBackend internal constructor(
         mutableState.update {
             it.copy(
                 position = ((position ?: 0.0) * 1000.0).roundToLong().milliseconds,
+                bufferedPosition = bufferedEnd?.let { (it * 1000.0).roundToLong().milliseconds },
                 duration = duration?.let { value -> (value * 1000.0).roundToLong().milliseconds },
                 videoWidth = width,
                 videoHeight = height,

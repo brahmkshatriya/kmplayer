@@ -4,4 +4,4 @@ package = dev.brahmkshatriya.kmplayer.mediafoundation
 compilerOpts = -Isrc/nativeInterop/cinterop/include
 staticLibraries = libkmplayer_mf_bridge.a
 libraryPaths = build/native/mediafoundation/mingwX64
-linkerOpts = -lmfplat -lole32 -loleaut32 -ld3d11 -ldxgi
+linkerOpts = -lmfplat -lmfuuid -lole32 -loleaut32 -ld3d11 -ldxgi

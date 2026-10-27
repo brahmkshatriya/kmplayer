@@ -14,6 +14,7 @@ pluginManagement {
         id("com.vanniktech.maven.publish") version mavenPublishPluginVersion
     }
     repositories {
+        mavenLocal()
         gradlePluginPortal()
         google()
         mavenCentral()
@@ -22,6 +23,7 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        mavenLocal()
         google()
         mavenCentral()
         maven("https://redirector.kotlinlang.org/maven/compose-dev")

@@ -11,6 +11,10 @@ struct kmplayer_gst_player {
     GstElement *playbin;
     GstBus *bus;
     GstAppSink *video_sink;
+    GstElement *spectrum;
+    float spectrum_bands[4096];
+    int spectrum_band_count;
+    int spectrum_sample_rate;
     GstSample *last_sample;
     double speed;
 };
@@ -61,6 +65,15 @@ kmplayer_gst_player *kmplayer_gst_player_create(int audio_only, char *error_mess
         return NULL;
     }
     player->bus = gst_element_get_bus(player->playbin);
+
+    // Optional filter only publishes spectrum messages while analysis is enabled.
+    player->spectrum = gst_element_factory_make("spectrum", NULL);
+    if (player->spectrum) {
+        g_object_set(G_OBJECT(player->spectrum),
+            "post-messages", FALSE, "message-phase", FALSE,
+            "threshold", -120, NULL);
+        g_object_set(G_OBJECT(player->playbin), "audio-filter", player->spectrum, NULL);
+    }
 
     if (audio_only) {
         guint flags = 0;
@@ -157,6 +170,32 @@ int kmplayer_gst_player_set_muted(kmplayer_gst_player *player, int muted) {
     return 1;
 }
 
+int kmplayer_gst_player_set_spectrum(kmplayer_gst_player *player, int bands, int update_rate_hz) {
+    if (!player || !player->spectrum) return 0;
+    if (bands <= 0 || update_rate_hz <= 0) {
+        g_object_set(G_OBJECT(player->spectrum), "post-messages", FALSE, NULL);
+        player->spectrum_band_count = 0;
+        return 1;
+    }
+    if (bands > 4096) return 0;
+    player->spectrum_band_count = 0;
+    g_object_set(G_OBJECT(player->spectrum),
+        "post-messages", FALSE,
+        "bands", (guint)bands,
+        "interval", (guint64)(GST_SECOND / update_rate_hz),
+        "post-messages", TRUE, NULL);
+    return 1;
+}
+
+int kmplayer_gst_player_copy_spectrum(kmplayer_gst_player *player,
+    float *bands, int capacity, int *sample_rate_hz) {
+    if (!player || !bands || capacity <= 0 || player->spectrum_band_count <= 0) return 0;
+    int count = player->spectrum_band_count < capacity ? player->spectrum_band_count : capacity;
+    memcpy(bands, player->spectrum_bands, (size_t)count * sizeof(float));
+    if (sample_rate_hz) *sample_rate_hz = player->spectrum_sample_rate;
+    return count;
+}
+
 int kmplayer_gst_player_set_speed(kmplayer_gst_player *player, double speed) {
     if (!player || speed <= 0.0) return 0;
 
@@ -229,6 +268,28 @@ int64_t kmplayer_gst_player_duration_ms(kmplayer_gst_player *player) {
     gint64 duration = GST_CLOCK_TIME_NONE;
     if (!gst_element_query_duration(player->playbin, GST_FORMAT_TIME, &duration) || duration < 0) return -1;
     return (int64_t)(duration / GST_MSECOND);
+}
+
+int64_t kmplayer_gst_player_buffered_end_ms(kmplayer_gst_player *player) {
+    if (!player || !player->playbin) return -1;
+    GstQuery *query = gst_query_new_buffering(GST_FORMAT_TIME);
+    if (!gst_element_query(player->playbin, query)) {
+        gst_query_unref(query);
+        return -1;
+    }
+    const gint64 position = (gint64)kmplayer_gst_player_position_ms(player) * GST_MSECOND;
+    int64_t end_ms = -1;
+    const guint count = gst_query_get_n_buffering_ranges(query);
+    for (guint i = 0; i < count; ++i) {
+        gint64 start = -1, end = -1;
+        if (gst_query_parse_nth_buffering_range(query, i, &start, &end) &&
+            start <= position + 100 * GST_MSECOND && end >= position) {
+            end_ms = (int64_t)(end / GST_MSECOND);
+            break;
+        }
+    }
+    gst_query_unref(query);
+    return end_ms;
 }
 
 int kmplayer_gst_player_is_seekable(kmplayer_gst_player *player) {
@@ -360,7 +421,8 @@ int kmplayer_gst_player_poll_event(
         GST_MESSAGE_EOS |
         GST_MESSAGE_ASYNC_DONE |
         GST_MESSAGE_BUFFERING |
-        GST_MESSAGE_TAG
+        GST_MESSAGE_TAG |
+        GST_MESSAGE_ELEMENT
     );
     if (!event) return KMPLAYER_GST_EVENT_NONE;
 
@@ -399,6 +461,32 @@ int kmplayer_gst_player_poll_event(
             }
             g_free(title);
             if (tags) gst_tag_list_unref(tags);
+            break;
+        }
+        case GST_MESSAGE_ELEMENT: {
+            if (!player->spectrum) break;
+            const GstStructure *structure = gst_message_get_structure(event);
+            if (!structure || !gst_structure_has_name(structure, "spectrum")) break;
+            const GValue *magnitudes = gst_structure_get_value(structure, "magnitude");
+            if (!magnitudes || !GST_VALUE_HOLDS_LIST(magnitudes)) break;
+            GstPad *pad = gst_element_get_static_pad(player->spectrum, "sink");
+            GstCaps *caps = pad ? gst_pad_get_current_caps(pad) : NULL;
+            int rate = 0;
+            if (caps && gst_caps_get_size(caps) > 0)
+                gst_structure_get_int(gst_caps_get_structure(caps, 0), "rate", &rate);
+            if (caps) gst_caps_unref(caps);
+            if (pad) gst_object_unref(pad);
+            if (rate <= 0) break;
+            guint count = gst_value_list_get_size(magnitudes);
+            if (count > 4096) count = 4096;
+            for (guint i = 0; i < count; i++) {
+                const GValue *v = gst_value_list_get_value(magnitudes, i);
+                player->spectrum_bands[i] = G_VALUE_HOLDS_FLOAT(v) ? g_value_get_float(v) :
+                    G_VALUE_HOLDS_DOUBLE(v) ? (float)g_value_get_double(v) : -120.0f;
+            }
+            player->spectrum_band_count = (int)count;
+            player->spectrum_sample_rate = rate;
+            result = KMPLAYER_GST_EVENT_SPECTRUM;
             break;
         }
         default:
