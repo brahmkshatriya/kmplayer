@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import platform.AVFoundation.*
+import platform.AVFoundation.audioOutputDeviceUniqueID
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
 import platform.CoreMedia.CMTimeRangeContainsTime
@@ -145,6 +146,10 @@ internal class AvFoundationKMPlayerBackend internal constructor(
             if (mutableState.value.playWhenReady) player.rate = speed.toFloat()
             mutableState.update { it.copy(speed = speed) }
         }
+    }
+
+    override fun setAudioOutputDevice(deviceId: String?): KMResult<Unit> = action {
+        player.audioOutputDeviceUniqueID = deviceId
     }
 
     override fun setVideoEnabled(enabled: Boolean): KMResult<Unit> {

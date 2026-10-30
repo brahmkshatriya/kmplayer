@@ -43,6 +43,14 @@ class KMVideoSurfaceRegistrationTest {
         assertIs<KMResult.Failure>(player.registerVideoSurface())
         assertEquals(emptyList(), backend.videoChanges)
     }
+
+    @Test
+    fun unsupportedAudioOutputRoutingReturnsExplicitFailure() {
+        val player = KMPlayer(FakeBackend(video = false), KMPlayerConfig(audioOnly = true))
+        val result = assertIs<KMResult.Failure>(player.setAudioOutputDevice("external-speaker"))
+        assertEquals("audio-output-unavailable", result.error.code)
+        player.close()
+    }
 }
 
 private class FakeBackend(video: Boolean) : KMPlayerBackend {

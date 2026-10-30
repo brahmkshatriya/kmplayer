@@ -244,6 +244,11 @@ public class KMPlayer internal constructor(
     public fun setMuted(muted: Boolean): KMResult<Unit> = platformBackend.setMuted(muted)
     public fun setSpeed(speed: Double): KMResult<Unit> = platformBackend.setSpeed(speed)
 
+    /** Select a player-specific output where supported (macOS AVFoundation).
+     * Pass null to return to the system default. Other backends may reject the request.
+     */
+    public fun setAudioOutputDevice(deviceId: String?): KMResult<Unit> = platformBackend.setAudioOutputDevice(deviceId)
+
     /** Analyze decoded audio from this player without capturing other applications' sound.
      * Analysis is optional and may disable hardware offload on some platforms.
      * Backends without a compatible audio tap report audio-analysis-unavailable. */

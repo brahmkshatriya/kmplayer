@@ -26,6 +26,9 @@ internal interface KMPlayerBackend : AutoCloseable {
     fun setVolume(volume: Double): KMResult<Unit>
     fun setMuted(muted: Boolean): KMResult<Unit>
     fun setSpeed(speed: Double): KMResult<Unit>
+    /** Optional per-player output routing; unsupported backends reject the request. */
+    fun setAudioOutputDevice(deviceId: String?): KMResult<Unit> =
+        KMResult.Failure(KMPlayerError("audio-output-unavailable", "This player cannot route audio to a specific output."))
     fun setVideoEnabled(enabled: Boolean): KMResult<Unit>
     fun createAudioAnalyzer(config: KMAudioAnalyzerConfig): KMResult<KMAudioAnalyzer> =
         KMResult.Failure(KMPlayerError("audio-analysis-unavailable", "Audio analysis is not supported by this playback backend."))
